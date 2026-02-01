@@ -1,0 +1,231 @@
+---
+title: "Manual DoubleML with XGBoost"
+author: "ML"
+date: "2025-04-04"
+output: 
+  html_document:
+    toc: true
+    code-fold: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+library(xgboost)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(caret)
+# or, if one did not want to load the package 
+# "caret" %in% installed.packages()[, "Package"]
+library(DoubleML) # for make_plr_CCDDHNR2018
+library(mvtnorm)
+
+library(mlr3misc)
+lgr::get_logger("mlr3")$set_threshold("warn")
+rerun = TRUE
+n_cores = 50
+nReps = 500
+```
+
+## Manual DML
+
+Estimate the causal effect of a treatment ( D ) on an outcome ( Y ), controlling for high-dimensional confounders ( X ), using a manual implementation of Double Machine Learning.
+
+We simulate data where ( Y = \theta D + f(X) + \varepsilon ), and estimate ( \theta ) using residual-on-residual regression after partialing out ( X ) using XGBoost.
+
+## Cross Fitting
+
+Estimate the causal effect of a treatment ( D ) on an outcome ( Y ), controlling for high-dimensional confounders ( X ), using a manual implementation of Double Machine Learning with cross-fitting. Also compare to naive OLS.
+
+We simulate data where ( Y = \theta D + f(X) + \varepsilon ), and estimate ( \theta ) using residual-on-residual regression after partialing out ( X ) using XGBoost.
+
+### Simulation and Estimation Function with Cross-Fitting
+
+```{r}
+manual_doubleml_cf <- function(n = 2000, p = 10, theta = 0.5, K = 2, seed = NULL, dgp = c("linear_uncorrelated", "linear_correlated", "nonlinear")) {
+  if (!is.null(seed)) set.seed(seed)
+  dgp <- match.arg(dgp)
+  beta_X <- rnorm(p)
+  
+  if (dgp == "nonlinear") {
+    n_vars = 5
+    alpha = 0.5
+    dat <- make_plr_CCDDHNR2018(alpha=alpha, n_obs=n, dim_x=n_vars, return_type="data.frame")
+    X <- as.matrix(dat[,paste0("X", 1:n_vars)])
+    D <- dat$d
+    Y <- dat$y
+  } else {
+    if (dgp == "linear_uncorrelated") {
+      X <- matrix(rnorm(n * p), nrow = n, ncol = p)
+    } else if (dgp == "linear_correlated") {
+      Sigma <- 0.5 ^ abs(outer(1:p, 1:p, "-"))  # AR(1) structure
+      X <- rmvnorm(n, sigma = Sigma)
+    }
+
+    # Shared coefficients to create confounding
+    beta_shared <- rnorm(p)
+    D <- X %*% beta_shared + rnorm(n)
+    Y <- theta * D + X %*% beta_shared + rnorm(n)
+  }
+  # } else if (dgp == "linear_uncorrelated") {
+  #   X <- matrix(rnorm(n * p), nrow = n, ncol = p)
+  #   D <- X %*% beta_X + rnorm(n)
+  #   Y <- theta * D + X[, 1:10] %*% rnorm(10) + rnorm(n)
+  # } else if (dgp == "linear_correlated") {
+  #   Sigma <- 0.5 ^ abs(outer(1:p, 1:p, "-"))  # AR(1) structure
+  #   X <- rmvnorm(n, sigma = Sigma)
+  #   D <- X %*% beta_X + rnorm(n)
+  #   Y <- theta * D + X %*% rnorm(p) + rnorm(n)
+  # }
+
+
+  # Create folds
+  folds <- createFolds(1:n, k = K, list = TRUE, returnTrain = FALSE)
+  D_tilde <- rep(NA, n)
+  Y_tilde <- rep(NA, n)
+
+  for (k in 1:K) {
+    test_idx <- folds[[k]]
+    train_idx <- setdiff(1:n, test_idx)
+
+    # D ~ X
+    dtrain_D <- xgb.DMatrix(data = X[train_idx, ], label = D[train_idx])
+    model_D <- xgboost(data = dtrain_D, nrounds = 20, objective = "reg:squarederror", verbose = 0)
+    D_hat <- predict(model_D, newdata = X[test_idx, ])
+
+    # Y ~ X
+    dtrain_Y <- xgb.DMatrix(data = X[train_idx, ], label = Y[train_idx])
+    model_Y <- xgboost(data = dtrain_Y, nrounds = 20, objective = "reg:squarederror", verbose = 0)
+    Y_hat <- predict(model_Y, newdata = X[test_idx, ])
+
+    D_tilde[test_idx] <- D[test_idx] - D_hat
+    Y_tilde[test_idx] <- Y[test_idx] - Y_hat
+  }
+
+  # Final stage OLS
+  theta_hat_cf <- unname(coef(lm(Y_tilde ~ D_tilde)))[2]
+
+  # Naive OLS for comparison
+  naive_theta <- unname(coef(lm(Y ~ D)))[2]
+  
+  # No cross-fitting: train on full sample
+  model_D_full <- xgboost(data = xgb.DMatrix(data = X, label = D), nrounds = 20, objective = "reg:squarederror", verbose = 0)
+  D_hat_full <- predict(model_D_full, newdata = X)
+
+  model_Y_full <- xgboost(data = xgb.DMatrix(data = X, label = Y), nrounds = 20, objective = "reg:squarederror", verbose = 0)
+  Y_hat_full <- predict(model_Y_full, newdata = X)
+
+  D_tilde_ncf <- D - D_hat_full
+  Y_tilde_ncf <- Y - Y_hat_full
+
+  theta_hat_ncf <- unname(coef(lm(Y_tilde_ncf ~ D_tilde_ncf)))[2]
+
+  return(c(theta_hat_cf = theta_hat_cf, theta_hat_ncf = theta_hat_ncf, naive_theta = naive_theta))
+
+  #return(c(theta_hat = theta_hat, naive_theta = naive_theta))
+}
+
+runSim = function(nReps = 500, n_cores = 1, dgp = "linear_uncorrelated"){
+  if (n_cores == 1){
+    results_cf <- replicate(nReps, manual_doubleml_cf(seed = sample.int(1e6, 1), dgp = dgp))
+    results_df <- as_tibble(t(results_cf))
+  } else {
+    library(foreach)
+    library(doParallel)
+    if (is.null(n_cores)) n_cores <- detectCores() - 1
+    cl <- makeCluster(n_cores)
+    registerDoParallel(cl)
+    clusterExport(cl, varlist = c("manual_doubleml_cf"))  
+    
+    results_cf <- foreach(i = 1:nReps, .combine = rbind,
+                            .packages = c("xgboost", "caret", "DoubleML", "mvtnorm")) %dopar% {
+      manual_doubleml_cf(seed = sample.int(1e6, 1), dgp = dgp)
+    }
+    
+    stopCluster(cl)
+    results_df <- as_tibble(results_list)
+  }
+  
+  return(results_df)
+}
+```
+
+```{r eval = F, echo = F}
+## Run Once
+manual_doubleml_cf(seed = 123, dgp = "nonlinear")
+manual_doubleml_cf(seed = 123, dgp = "linear_uncorrelated")
+manual_doubleml_cf(seed = 123, dgp = "linear_correlated")
+```
+
+## Linear, uncorrelated DGP
+
+```{r sim_dgp_LU, eval = rerun}
+results_df = runSim(nReps = nReps, n_cores = n_cores, dgp = "linear_uncorrelated")
+
+save(results_df, file = "simData/results_cf_lu.rda")
+```
+
+```{r, echo=FALSE}
+load("simData/results_cf_lu.rda")
+```
+
+```{r, echo=FALSE}
+results_df_long <- pivot_longer(results_df, cols = everything(), names_to = "method", values_to = "estimate")
+
+# Plot
+
+ggplot(results_df_long, aes(x = estimate, fill = method)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30, color = "black") +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed") +
+  facet_wrap(~method, scales = "free") +
+  labs(title = "DoubleML vs Naive OLS: Linear Uncorrelated DGP",
+       x = "Estimated Theta", y = "Frequency")
+```
+
+## Correlated data
+
+```{r sim_dgp_LC, eval = rerun}
+results_df = runSim(nReps = nReps, n_cores = n_cores, dgp = "linear_correlated")
+save(results_df, file = "simData/results_cf_lc.rda")
+```
+
+```{r, echo=FALSE}
+load("simData/results_cf_lc.rda")
+```
+
+```{r, echo=FALSE}
+results_df_long <- pivot_longer(results_df, cols = everything(), names_to = "method", values_to = "estimate")
+
+# Plot
+
+ggplot(results_df_long, aes(x = estimate, fill = method)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30, color = "black") +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed") +
+  facet_wrap(~method, scales = "free") +
+  labs(title = "DoubleML vs Naive OLS, Linear Correlated DGP",
+       x = "Estimated Theta", y = "Frequency")
+```
+
+## Nonlinear data
+
+```{r sim_dgp_nl, eval = rerun}
+results_df = runSim(nReps = nReps, n_cores = n_cores, dgp = "nonlinear")
+save(results_df, file = "simData/results_cf_nl.rda")
+```
+
+```{r, echo=FALSE}
+load("simData/results_cf_nl.rda")
+```
+
+```{r, echo=FALSE}
+results_df_long <- pivot_longer(results_df, cols = everything(), names_to = "method", values_to = "estimate")
+
+# Plot
+
+ggplot(results_df_long, aes(x = estimate, fill = method)) +
+  geom_histogram(position = "identity", alpha = 0.6, bins = 30, color = "black") +
+  geom_vline(xintercept = 0.5, color = "red", linetype = "dashed") +
+  facet_wrap(~method, scales = "free") +
+  labs(title = "DoubleML vs Naive OLS, Nonlinear  DGP",
+       x = "Estimated Theta", y = "Frequency")
+```

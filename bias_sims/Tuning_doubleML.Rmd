@@ -1,0 +1,84 @@
+---
+title: "Tuning DoubleML"
+author: "ML"
+date: "2025-04-04"
+output: 
+  html_document:
+    toc: true
+    code-fold: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=F, warning=F)
+source("dml_functions.R")
+
+library(mlr3misc)
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+rerun = FALSE
+n_cores = 1
+nReps = 500
+```
+
+## Example Runs
+
+```{r}
+dml_single_run_builtin_only(dgp="nonlinear", learner_type = c("xgboost", "ranger")[2])
+runSim(B=2, num_cores = 1, dgp = "nonlinear", learner_type = "ranger")
+runSim(B=2, num_cores = 1, dgp = "linear_uncorrelated", learner_type = "xgboost")
+```
+
+```{r}
+dml_single_run_builtin_only()
+
+run_all_simulations(test = TRUE)
+results_df <- aggregate_sim_results("sim_results")
+plot_theta_distributions(results_df)
+```
+
+```{r}
+run_all_simulations(test = F)
+results_df <- aggregate_sim_results("sim_results")
+plot_theta_distributions(results_df)
+```
+
+
+```{r}
+dml_single_run()
+```
+
+```{r}
+  results_df <- runSim(B = 1, dgp = "linear_correlated", learner_type = "xgboost", learner_params = list(nrounds = 20, eta = 0.3), num_cores = 1, n_folds = 2)
+```
+
+## grid search
+
+```{r}
+# For testing
+#results_test <- run_all_simulations(test = TRUE)
+
+# For full simulation
+results_full <- run_all_simulations(test = FALSE)
+```
+
+## Plot
+
+```{r}
+results_df_long <- pivot_longer(results_df, cols = everything(), names_to = "method", values_to = "estimate")
+  
+  # Plot
+  
+  ggplot(results_df_long, aes(x = estimate, fill = method)) +
+    geom_histogram(position = "identity", alpha = 0.6, bins = 30, color = "black") +
+    geom_vline(xintercept = 0.5, color = "red", linetype = "dashed") +
+    facet_wrap(~method, scales = "free") +
+    labs(title = "Distribution of Estimates: Manual DoubleML vs Built-in vs Naive OLS",
+         x = "Estimated Theta", y = "Frequency")
+```
+
+## Bias and Variance Summary
+
+```{r}
+  results_df %>%
+    summarise(across(everything(), list(mean = mean, sd = sd)))
+```
